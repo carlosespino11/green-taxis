@@ -1,0 +1,635 @@
+---
+title: "NYC Green Taxi Trips Analysis"
+author: "CE C757289"
+date: "10/4/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE, warning = FALSE, fig.align = 'center',
+                      out.width = '70%')
+```
+
+The following list of packages will be used. They provide functions to plot, model, parallel processing, wrangle data, scale data, manipulate spatial data and present data nicely.
+
+```{r}
+library(pander)
+library(caretEnsemble)
+library(doMC)
+library(caret)
+library(tidyverse)
+library(sf)
+library(magrittr)
+library(scales)
+library(magrittr)
+library(scales)
+library(ggthemes)
+library(lubridate)
+library(skimr)
+library(corrr)
+```
+
+## Question 1.
+
+Download the data using the `read_csv` function from the `readr` package included in the `tidyverse`. 
+
+```{r load_data, cache=TRUE}
+raw_taxi_df = read_csv('https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-09.csv')
+```
+
+The dimension of the data set is
+
+```{r}
+# Get dimensions
+dimensions = dim(raw_taxi_df) %>%
+  #Format the numbers for printing
+  comma() 
+
+tibble(rows = dimensions[1], columns = dimensions[2]) %>% 
+  knitr::kable()
+```
+
+
+## Question 2. 
+
+Using the `ggplot` package, we plot the histogram of `Trip_distance`.  
+
+```{r}
+ggplot(raw_taxi_df) +
+  geom_histogram(aes(x = Trip_distance),bins = 80) + 
+  labs(x = 'trip distance (miles)', title = 'Trip distance distribution',
+       subtitle = 'Original scale')+ 
+  theme_fivethirtyeight()
+```
+
+
+It can be observed that the distribution of `Trip_distance` is highly skewed and it has a long right tail and probably some outliers. For example, trips distances equal to 0 or trips with more than a 100 miles are clearly outliers. 
+
+Some rules of thumb exist to remove such outliers, for example, removing the values farther than 3 times the standard deviation of the trip distance from the median/mean or using the IQR rule. However, these rules usually don't work well in highly skewed distributions because they cut the long tail and hence, some possible valuable information. We have to be careful when we decide to remove observations and look deeper into those cases, so this analysis will try to remove as less information as possible
+
+Looking at the top 15 highest `Trip_distance` values 
+
+```{r}
+raw_taxi_df  %>% top_n(15, Trip_distance) %>%
+  select(Trip_distance) %>%
+  arrange(desc(Trip_distance)) %>%
+  mutate(rank = 1:15)%>%
+  knitr::kable()
+```
+
+The filters to apply are:
+
+1. Removing trips with less than 100 miles. Looking at the table above, we see that we would only lose 10 observations.
+2. Remove trip distances whose value is less or equal than 0. In this context, a 0 means that the trip didn't happen or that the localization sensor was not working properly. 
+
+This filtered dataset will be used in the analysis that follows
+
+```{r}
+taxi_df = raw_taxi_df %>% 
+  filter(Trip_distance<100,
+         Trip_distance > 0) 
+```
+
+The new dimension of the dataset is
+
+```{r echo = FALSE}
+# Get dimensions
+dimensions = dim(taxi_df) %>%
+  #Format the numbers for printing
+  comma() 
+
+tibble(rows = dimensions[1], columns = dimensions[2]) %>% 
+  knitr::kable()
+```
+
+
+Looking now at the distribution of the filtered data:
+
+```{r}
+ggplot(taxi_df) +
+  geom_histogram(aes(x = Trip_distance),bins = 50) + 
+  labs(x = 'trip distance (miles)', title = 'Trip distance distribution',
+       subtitle = 'Original scale')+ 
+  theme_fivethirtyeight()
+```
+
+
+
+We see the shape more clear, we still notice the skewness of the distribution. This shape suggests that distribution of `Trip_distance` may follow a parametric distribution like  chi-squared, Weibull or log-normal.
+
+Looking at the same distribution using a logarithm scale on `Trip_distance` we get
+
+
+```{r}
+ggplot(taxi_df) +
+  geom_histogram(aes(x = Trip_distance)) + 
+  # scale_x_log10(breaks = 10^(-2:4),labels = c(0.01, 0.1, 1, 10, 100,1000,10000 ) ) + 
+  scale_x_log10() + 
+  labs(x = 'trip distance (miles)', title = 'Trip distance distribution',
+       subtitle = 'Logarithmic Scale.')+ 
+  theme_fivethirtyeight()
+```
+
+With the logarithmic scale, it looks more like a Gaussian bell, strengthening the hypothesis that `Trip_distance` follows a log-normal distribution. Fitting a normal distribution and doing a statistical test, like goodness of fit test, for example, we could corroborate this in a more formal way.
+
+To give us an idea on how skewed the distribution is, we can compute the cumulative distribution function of `Trip_distance`.
+
+```{r}
+probs = seq(0,1,by=0.01)
+quants = quantile(taxi_df$Trip_distance, probs = seq(0,1,by=0.01))
+
+ggplot() +
+  geom_line(aes(y = probs, x = quants)) +
+  labs(x = 'trip distance (miles)', title = 'Trip distance cumulative distribution function',
+       subtitle = 'Original Scale.')+ 
+  theme_fivethirtyeight()
+```
+
+We see, that it accumulates almost all the probability mass in the beginning. Zooming in the beginning to see it more clear
+  
+```{r}
+ ggplot() +
+  geom_line(aes(y = probs, x = quants)) +
+  scale_x_continuous(limits = c(0,15))+
+  labs(x = 'trip distance (miles)', title = 'Trip distance distribution',
+       subtitle = 'Original Scale.')+ 
+  theme_fivethirtyeight()
+```
+
+We see that in 15 miles it accumulates almost all the mass. In fact the quantile 99% corresponds to `r quantile(taxi_df$Trip_distance, .99)`.
+
+## Question 3.
+ 
+To compute the mean and median trip distance grouped by hour of day, a new variable `trip_hour` is computed. `trip_datetime` is just an average between the `lpep_pickup_datetime` and `lpep_dropoff_datetime`. 
+
+From `trip_datetime`, the `trip_hour` is derived directly using the `hour` function from the `lubridate` package.
+
+Finally, grouping by `trip_hour` and summarizing the `Trip_distance` by `median` and `mean` we get the  
+ 
+```{r}
+## Compute trip_hour and the mean & median trip distance by hour
+trip_dist_hour = taxi_df %>% 
+  mutate(trip_datetime = as_datetime((as.numeric(lpep_pickup_datetime) +
+                                        as.numeric(Lpep_dropoff_datetime))/2),
+         trip_hour = hour(trip_datetime)) %>%
+  group_by(trip_hour) %>%
+  summarize_at(vars(Trip_distance), 
+               funs(mean, median))
+
+
+## Plot mean & median trip distance by hour
+trip_dist_hour %>% gather(summ_fun, trip_distance, mean:median) %>%
+ggplot() +
+  geom_line(aes(x = trip_hour, y = trip_distance)) +
+  facet_grid(summ_fun ~ .) +
+  labs(y = 'trip distance (miles)', x = 'hour', 
+       title = 'Trip distance by hour',
+       subtitle = 'Mean & median')+ 
+  theme_fivethirtyeight()
+
+```
+
+We can see that the trip distance is higher early in the morning, which may correspond to commuters, and  late in the day, which may indicate late night users going for from where they live.
+
+To extract some useful information about the trips that start or end at the airports, we use the shape files from https://www1.nyc.gov/site/planning/data-maps/open-data/dwn-nynta.page to map the coordinates from pickup longitude and latitude and drop-off longitude and latitude to the pickup and drop-off boroughs and neighborhoods respectively.
+
+The following script achieves that by doing a spatial join between the coordinates and the NYC boroughs and neighborhoods shapefile.
+
+
+```{r spatial_joins, cache=TRUE}
+## Read NYC Borough and neighborhood shapefile 
+ny_shapes = read_sf('data/nynta_18a/nynta.shp')
+
+
+## Spatial join for dropoff coordinates
+dropoff_neigh = taxi_df %>% select(Dropoff_longitude, Dropoff_latitude) %>% 
+  sf::st_as_sf(coords = c("Dropoff_longitude", "Dropoff_latitude"), crs = 4326) %>%
+  sf::st_transform(st_crs(ny_shapes)) %>%
+  sf::st_join(ny_shapes) %>% 
+  sf::st_set_geometry(NULL) %>% 
+  as_tibble()%>%
+  select(BoroName, NTACode)%>% 
+  mutate(BoroName = ifelse(is.na(BoroName), 'Other', BoroName), 
+         NTACode = ifelse(is.na(NTACode), 'Other', NTACode)) %>% 
+  dplyr::rename_all(~ paste('dropoff', . , sep='_'))
+  
+## Spatial join for pickup coordinates
+pickup_neigh =taxi_df %>% select(Pickup_longitude, Pickup_latitude) %>% 
+  sf::st_as_sf(coords = c("Pickup_longitude", "Pickup_latitude"), crs = 4326) %>%
+  sf::st_transform(st_crs(ny_shapes)) %>%
+  sf::st_join(ny_shapes) %>% 
+  sf::st_set_geometry(NULL) %>%  
+  as_tibble() %>% 
+  select(BoroName, NTACode) %>% 
+  mutate(BoroName = ifelse(is.na(BoroName), 'Other', BoroName), 
+         NTACode = ifelse(is.na(NTACode), 'Other', NTACode)) %>% 
+  dplyr::rename_all(~ paste('pickup', . , sep='_')) 
+
+## Add the original and computed columns into a dataset  
+taxi_neigh_df = bind_cols(taxi_df, dropoff_neigh, pickup_neigh) 
+```
+
+Now we look at the trips to/from the Newark and JFK airports. We use the `RateCodeID` column whose value 2 corresponds to JFK and 3, to Newark (there's not a code specified for LaGuardia airport in the code book) . We compute the number and percentage of trips to/from the airports
+
+```{r}
+## Choose trips that go to the airport
+taxi_air_df = taxi_neigh_df %>% 
+  filter(RateCodeID %in% c(2, 3)) %>%
+  mutate(airport = factor(RateCodeID, levels = c(2, 3), labels = c('JFK', 'Newark')))
+
+
+## Compute percentage and count
+tibble(n = nrow(taxi_air_df), perc = percent(nrow(taxi_air_df)/nrow(taxi_neigh_df)))%>%
+  knitr::kable(col.names = c('number', 'percent'), caption = 'Trips to/from Newark and JFK')
+```
+
+Now, among the airport trips, we look at the share of each of them
+```{r}
+ggplot(taxi_air_df) + 
+  geom_bar(aes(x = airport, y =(..count..)/sum(..count..))) +
+  scale_y_continuous(labels = percent) +
+  labs(title = 'Share of taxis rides by airports', subtitles='Newark vs JFK', y= 'share') +
+  theme_fivethirtyeight()
+```
+
+Around 80% of the airport trips correspond to JFK and around 20%, to Newark.
+
+
+Now, taking a look at where do airport trips come from by borough:
+
+```{r}
+taxi_air_df%>% 
+  group_by(airport) %>%
+  mutate(n_air = n()) %>%
+  group_by(airport, pickup_BoroName) %>%
+  summarize(n_air_boro= n(), n_air = mean(n_air)) %>%
+  ungroup() %>%
+  mutate(perc = n_air_boro/n_air) %>%
+  ggplot() + 
+    geom_bar(aes(x =pickup_BoroName, y =perc), stat = 'identity') +
+    facet_grid(airport ~.) + 
+    scale_y_continuous(labels = percent) +
+    labs(title = 'Where do airport trips come from?', 
+         subtitles='NYC Boroughs. Newark vs JFK', y= 'share of trips', x= 'borough') +
+    theme_fivethirtyeight()
+```
+
+Interestingly, to JFK, the trips come mostly from Manhattan, while the trips to Newark, come mostly from Brooklyn.
+
+Doing a similar analysis looking at where do airport trips go to by borough:
+
+```{r}
+taxi_air_df%>% 
+  group_by(airport) %>%
+  mutate(n_air = n()) %>%
+  group_by(airport, dropoff_BoroName) %>%
+  summarize(n_air_boro= n(), n_air = mean(n_air)) %>%
+  ungroup() %>%
+  mutate(perc = n_air_boro/n_air) %>%
+  ggplot() + 
+    geom_bar(aes(x =dropoff_BoroName, y =perc), stat = 'identity') +
+    facet_grid(airport ~.) + 
+    scale_y_continuous(labels = percent) +
+    labs(title = 'Where do airport trips go to?',
+         subtitles='NYC Boroughs. Newark vs JFK', y= 'share of trips', x= 'borough') + 
+    theme_fivethirtyeight()
+```
+
+Trips from JFK go more to Queens, while trips from Newark, go mostly outside NYC, probably somewhere in New Jersey.
+
+
+
+## Question  4.
+
+Now, we proceed to build a model to predict the tip percentage as a tip as a percentage of the total fare.
+
+The following cleaning is performed:
+
+1. Keep only credit card transaction (`Payment_type` == 1). This is because because the `Tip_amount` field is populated for credit card tips and doesn't include cash.
+2. Remove tip amount of 0. Following the reasoning from above, if there's a tip with amount of 0, there's no way to know if it was because the customer didn't give a tip or if it was because the tip was given in cash. 
+3. Remove tip percentage greater than 100%. It's very unlikely that someone will tip more than the fare amount.
+
+
+```{r}
+## Compute Tip_percent and aplly discussed filters
+taxi_premodel_df = taxi_neigh_df %>% 
+  mutate(Tip_percent = Tip_amount/Fare_amount) %>%
+  filter(Tip_amount > 0,
+         Tip_percent <= 1,
+         Payment_type == 1) 
+```
+
+Having a first look at the dataset:
+
+```{r results='asis'}
+skimr::skim(taxi_premodel_df) %>%
+  skimr::kable() 
+```
+
+There are a few steps to take to prepare the data for modelling:
+
+Cleaning:
+
+1. Drop unknown column `Ehail_fee` and irrelevant feature for this problem `Store_and_fwd_flag`.
+2. Convert `RateCodeID`, `Trip_type` and `VendorID` to categorical.
+3. Remove observations where `lpep_pickup_datetime` is equal to `Lpep_dropoff_datetime`.
+4. Remove `payment_type` because we are already imposing the restriction of looking only into credit card transactions.
+5. Remove pickup and drop-off boroughs from/to  _Other_ or _Staten Island_ . This is because almost all the cases correspond to the main 4 NYC Boroughs.
+
+Feature Engineering:
+
+1. Transform pickup and drop-off date times to useful features like hour of day, trip duration in hours, day of month, day of week, and whether or not it's weekday or weekend.
+2. Compute if the trip occurred in peak time (times between 6 am to 9 am and 6 pm to 8 pm).
+3. Compute average speed, computed as the distance divided by the duration.
+4. Instead of using drop-off and pickup longitude and latitude raw values, keep only the drop-off and pickup boroughs and the 20 most popular neighborhoods.
+
+Sampling for faster modeling:
+
+1. Due to computation and time constraints, a sample of size 100,000 is chosen to reduce the training time. 
+The discussed data processing is showed below
+
+```{r}
+set.seed(1)
+
+taxi_model_df = taxi_premodel_df %>%
+  # Remove Staten Island and Other
+  filter(! pickup_BoroName %in% c('Staten Island', 'Other'), 
+         ! dropoff_BoroName %in% c('Staten Island', 'Other')) %>% 
+  # Remove Ehail_fee and Store_and_fwd_flag
+  select(-Ehail_fee, -Store_and_fwd_flag) %>%
+  # Transform RateCodeID, Trip_type, VendorID to categorical
+  mutate_at(vars(RateCodeID, Trip_type, VendorID), funs(factor)) %>% 
+  # Filter out observations where Lpep_dropoff_datetime  is equal to lpep_pickup_datetime
+  filter(Lpep_dropoff_datetime !=lpep_pickup_datetime) %>%
+  # Compute Trip_duration
+  mutate(Trip_duration =  as.numeric(difftime(Lpep_dropoff_datetime,lpep_pickup_datetime, units="hours")))%>%
+  # Compute time variables  
+  mutate_at(vars(Lpep_dropoff_datetime, lpep_pickup_datetime), 
+            funs(hour = hour, wday = weekdays, day = day, 
+                 is_weekend= weekdays(.) %in% c('Saturday', 'Sunday'),
+                 is_peak = hour(.) %in% c(6,7,8,9,18,19,20))) %>%
+  # Compute Trip_speed and filter very high values
+  mutate(Trip_speed = Trip_distance/Trip_duration) %>%
+  filter(Trip_speed < 200) %>%
+  # Truncate neighborhoods to include only 20
+  mutate(pickup_neigh = fct_lump(pickup_NTACode, 20), dropoff_neigh = fct_lump(dropoff_NTACode, 20)) %>%
+  # Select relevant columns
+  select(Tip_percent, Fare_amount, Extra, MTA_tax, Tolls_amount, improvement_surcharge, Total_amount,
+         Passenger_count, Trip_distance, Trip_speed, pickup_BoroName, dropoff_BoroName,Trip_type, 
+         RateCodeID, VendorID, Trip_duration:dropoff_neigh) %>%
+  # Take a sample of size 100,000
+  sample_n(100000)
+  
+```
+
+
+Taking a look at our final dataset for modelling to see if it looks good:
+
+```{r results='asis'}
+skimr::skim(taxi_model_df) %>% 
+  skimr::kable() 
+```
+
+The data looks ready to start modelling.
+
+Before starting to model, we can make some basic exploratory analysis:
+
+```{r}
+ggplot(taxi_model_df) + 
+  geom_histogram(aes(x = Tip_percent)) + 
+  theme_fivethirtyeight() +
+  labs(title = "Distribution of tip percentage") + 
+  scale_x_continuous(labels = percent)
+```
+
+We can see that the mass of the distribution is around 20% to 25%, in fact, the mean and the median are 22%.
+
+
+Now looking at the linear Pearson correlations of `Tip_percent` with the other features
+
+```{r out.width = '70%'}
+# Compute correlation matrix
+corr_num = taxi_model_df %>% 
+  select_if(is.numeric) %>% 
+  corrr::correlate() %>% corrr::stretch() %>%
+  mutate(is_target = ifelse(y == 'Tip_percent', '', '  ')) %>%
+  filter(x != 'Tip_percent')
+
+# Plot correlations
+ggplot(corr_num) + geom_tile(aes(x=x, y=y, fill=r)) +
+  scale_fill_distiller(palette = 'RdYlBu', limits = c(-1,1)) +
+  facet_grid(is_target ~., scales = 'free_y', space = 'free_y') +
+  theme_fivethirtyeight() +
+  labs(title= "Correlation Matrix", subtitle="Target Feature: Tip Percent") +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1), axis.title =element_blank())
+```
+
+
+The linear relationship looks weak, this doesn't mean that we don't have good predictors. Some models capture non-linear relationships and even hidden interactions between features.
+
+Now, we can proceed to model the tip percentage.
+
+1- We split the data into training (80%) and testing (20%).
+
+
+```{r}
+set.seed(7)
+train_index = sample(1:nrow(taxi_model_df), floor(nrow(taxi_model_df)*0.8), replace=FALSE)
+
+# Split the data in training and testing
+train_df = taxi_model_df %>% slice(train_index)
+test_df = taxi_model_df %>% slice(-train_index)
+```
+
+2- The modeling strategy is as follows:
+
+* The metric used to assess the performance of the models, is the root mean squared error (RMSE). This metric is commonly used and it has the advantage that it combines the squared bias and variance.
+* We preprocess the data by standardizing (scaling and centering) the predictors.
+* By default dummies are created for the categorical features.
+* Three types of models will be trained: generalized linear model with elastic net regularization  (GLMNet), random forests and k-nearest neighbors. These models were chosen because they are very well-known, simple  and are usually uncorrelated.
+* A fourth stacked model will be trained as well. This stacking technique trains a new _stacking model_ that uses for training the predicted values of the three models mentioned above. The stacking model I'll use is a simple GLMNet.
+* The hyperparameters for all the models are chosen using a 3-fold cross validation technique and looking at the set of hyperparameters that minimizes the cross-validated RMSE. By default, the `caret` package, chooses a set of hyperparameters to tune, we will use these defaults.
+* To have an idea on how well our models perform, we are going to define a baseline model based on the mean of  the target variable. This means that, the baseline model, predicts always the mean of such feature.
+* The RMSE performance on the test set will be used to choose which model performed better.
+
+To start, first we train the models individually without stacking
+
+
+```{r train_model, cache = TRUE}
+set.seed(7)
+registerDoMC(cores=2)
+
+# Defining the 3-fold CV 
+train_control <- trainControl(
+  method="cv",
+  number=3
+)
+
+# Training the list of models discussed
+model_list <- caretList(
+  Tip_percent~., data = train_df,
+  trControl = train_control,
+  preProc = c("center", "scale"),
+  metric = 'RMSE',
+  methodList=c("glmnet", "knn", "rf")
+  )
+```
+
+Train the stacked model
+
+```{r train_stack, cache=TRUE}
+glmnet_stack <- caretStack(
+  model_list,
+  method="glmnet",
+  metric="RMSE",
+  trControl=train_control
+)
+```
+
+Compute the predictions by all the models.
+
+```{r predict_models, cache=TRUE}
+set.seed(7)
+# Baseline model
+baseline = mean(train_df$Tip_percent)
+
+# Compute predicitons on test set
+y_test = test_df %>% 
+  pull(Tip_percent)
+
+# List of models predictions
+models_pred = predict(model_list, newdata=test_df )%>%
+  as_data_frame()
+
+# Stacked prediction
+stack_pred = predict(glmnet_stack, newdata=test_df) 
+```
+
+
+Report the performance metrics for each model in the test set.
+
+```{r}
+# Compute performance of each model
+models_pred %>%
+  mutate(baseline = baseline, glmnet_stack = stack_pred) %>%
+  map_dfr(function(y_pred) {
+    tibble(
+      RMSE = RMSE(y_pred, y_test),
+      MAE = MAE(y_pred, y_test)
+    )
+  }, .id = 'model') %>%
+  arrange(RMSE) %>%
+  knitr::kable()
+```
+
+
+The models`glmnet_stack`, `glmnet` and `rf` performed had a much better performance than the baseline model, while `knn` performed slightly better than the baseline. As expected, the stacked model had the best performance.
+ 
+Now we take a look at the predictions vs the true value
+
+```{r}
+ggplot() +
+  geom_point(aes(x = stack_pred, y = y_test)) +
+  geom_abline(aes(color = '45° Reference Line', slope=1, intercept = 0)) +
+  labs(title = 'Tip Percentage: Predicted Y vs True Y', subtitle = 'Stacked Model. Test set.',
+       x = 'predicted', y= 'true') +
+  theme_fivethirtyeight()
+```
+The predictions align pretty well with the true values, however, there are some negative predicted values and the model is underestimating, a little bit, tips that are higher than 50%.
+
+
+Finally, let's see at the important features computed by the generalized linear model. I wanted to use the random forest to extract the important features, but I missed to choose the parameter that indicates the  model to save the importance, the training ran for a long time and there was not enough time to run it again.
+
+
+```{r results='asis'}
+imp = varImp(model_list$glmnet)
+
+tibble( feature =  row.names(imp$importance),importance = pull(imp$importance)) %>%
+  arrange(desc(importance))%>%
+  slice(1:10)%>%
+  ggplot() +
+    geom_segment(aes(y = fct_reorder(feature, importance),x =importance,yend=feature,xend=0))+
+    geom_point(aes(y = fct_reorder(feature, importance), x= importance)) +
+    theme_fivethirtyeight() +
+    labs(title = "Feature importance", subtitle = "Model: GLMNet", y = 'feature')
+```
+
+The most important features are related to the `Fare_amount` and `Total_amount`, this makes sense because a person that is already paying a lot of money for a trip is less willing to pay more tip.
+
+Also some important drop-off and pickup neighborhoods and boroughs show have some importance for the prediction.
+
+We could improve our predictions by:
+
+* Looking more closely to the observations removed.
+* Partitioning NYC areas in a different way.
+* Doing deeper exploratory analysis to remove outliers in other features and do better feature engineering.
+* Including more data from other periods.
+* Trying more types of models.
+* Trying more fine hyperparameter tuning with non-default values and using random search.
+* Truncating negative prediction to avoid getting negative values.
+* We can use the variable importance form other methods, like random forests, to reveal other important features.
+
+
+## Question 5
+
+Option B: Visualization
+
+To understand how people use green taxis in NYC, we create a shiny app that let us look at the network with the must busy neighborhood to neighborhood routes. The edges of the network are sized by number of trips, so thicker edges correspond to more trips. They are also colored by intra-neighborhood and inter-neighborhood graphs to help us compare how people travel inside boroughs and to other boroughs. Finally, the app let us filter by hour of day ranges, by day of the week ranges and by borough, so we can specifically look at the network at different times and to focus on specific boroughs.
+
+We preprocess and save the data that will be used for the visualization, this will allow the app to load faster.
+
+The shapefile information for the boroughs, can be downloaded from https://data.cityofnewyork.us/City-Government/Borough-Boundaries/tqmj-j8zm.
+
+```{r eval=FALSE}
+
+## Get the trip hour and weekday
+vis_df = taxi_neigh_df%>% 
+  mutate(pickup_hour = hour(lpep_pickup_datetime), 
+         dropoff_hour = hour(Lpep_dropoff_datetime),
+         trip_datetime = as_datetime((as.numeric(lpep_pickup_datetime) + as.numeric(Lpep_dropoff_datetime))/2),
+         trip_hour = hour(trip_datetime),
+         trip_weekday = wday(trip_datetime,
+                             week_start = getOption("lubridate.week.start", 1))) %>%
+  filter(!is.na(pickup_NTACode), !is.na(dropoff_NTACode) ) %>%
+  filter(!pickup_BoroName == 'Other',  !dropoff_BoroName == 'Other')%>%
+  select(pickup_NTACode, dropoff_NTACode, 
+         pickup_BoroName, dropoff_BoroName,
+         trip_hour, trip_weekday)
+
+vis_df %>%
+  write_rds('app-data/trips_df_app.rds')
+
+
+## Compute centroid for each neighborhood polygon. These coordinates will correspond to the edges of the
+# network
+neigh_centers =ny_shapes  %>% sf::st_centroid(ny_shapes) %>% 
+  sf::st_transform(st_crs(4326)) %>%
+  st_coordinates(x) %>%
+  as_tibble() %>% 
+  set_colnames(c('centroid_long', 'centroid_lat')) 
+
+## Convert the NYC neighborhood and borough polygons into longitude and latitude.
+ny_shapes_lonlat = ny_shapes %>%
+  mutate(centroid_long = neigh_centers$centroid_long, 
+                    centroid_lat = neigh_centers$centroid_lat) %>%
+  sf::st_transform(st_crs('+proj=longlat +datum=WGS84')) %>%
+  write_rds('app-data/ny_shapes_longlat.rds')
+
+read_sf('data/Borough Boundaries/geo_export_ada5c8a0-71b3-4814-85cc-679559f8602e.shp')%>%
+  st_transform(crs = '+proj=longlat +datum=WGS84') %>%
+  write_rds('app-data/ny_boroughs_longlat.rds')
+```
+
+Now, the network visualization (reload the browser if necessary). For a better experience, *click on* https://carlosespino11.shinyapps.io/nyc-taxi-network/ to see it full screen.
+
+
+<iframe src="https://carlosespino11.shinyapps.io/nyc-taxi-network/" width='100%', height='700px' ></iframe>
+
+
+The visualization suggests that New Yorkers use the green taxis to move more intra-borough. 
+
+If we see the unfiltered map, we see that green taxis have a lot of activity in northern Manhattan  and it also reveals important origin and destination meighborhoods like Astoria, Williamsburgh, Downtown Brooklyn, Long Island City, Upper West Side, Harlem, JFK, etc.
+
+There's a lot to discover if we filter by day and hour. We can explore where New Yorkers go out in a weekend night or the dynamics during rush hour.
+
+The code for the app is included in the `app.R` file.
